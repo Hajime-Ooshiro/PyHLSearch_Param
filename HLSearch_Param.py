@@ -4,11 +4,14 @@ import logging
 import logging.handlers
 import os
 import sys
+import datetime
 import time
+from pathlib import Path
 from collections.abc import Iterator, Sequence
 import numpy as np
 from numpy.typing import NDArray
 from tqdm import tqdm
+from numba import njit
 
 # --- logging設定 ---
 logger = logging.getLogger(__name__)
@@ -58,6 +61,7 @@ DEPTH: int = 8
 MAX_DEPTH: int = 249
 PROGRESS_MININTERVAL: float = 1.0  # tqdm進捗表示の最短更新間隔(秒)
 PROGRESS_COUNT: int = 10000
+BITS_PER_WORD: int = 64
 
 # 2,3,5,7,11,13,...,1579 の素数リスト
 PRIMES: list[int] = [
@@ -81,40 +85,37 @@ ROWS: int = len(PRIMES)
 PARAMS: list[list[int]] = []
 for row in range(ROWS):
     PARAMS.append([i for i in range(1, PRIMES[row])])
-# PARAMS[0] = [1]
+PARAMS[0] = [0]
 
-def shift_array(arr: NDArray[np.bool_], k: int) -> NDArray[np.bool_]:
-    """
-    配列を右にk個シフトする(numpy版)。先頭k要素は0埋めし、末尾のk要素は捨てる。
-    """
-    n = len(arr)
-    if k <= 0:
-        return arr.copy()
-    if k >= n:
-        return np.zeros(n, dtype=arr.dtype)
-    result = np.empty(n, dtype=arr.dtype)
-    result[:k] = 0
-    result[k:] = arr[: n - k]
-    return result
- 
-
-def build_base_rows(primes: Sequence[int]) -> NDArray[np.bool_]:
-    """
-    指定した素数リストからbase_rows配列を作る。
-
-    後段の処理(search)では「0かどうか」しか使わないため、値そのもの(素数p)
-    ではなく bool(idx % p == 1) を格納する。int64(8byte/要素)ではなく
-    bool(1byte/要素)にすることでメモリ転送量が1/8になり、shift_array や
-    AND演算のコストが下がる。
-    """
-    return np.array([(IDX % p == 1) for p in primes])
+@njit(cache=True)
+def intersect_masks_and_count(
+    base_mask: NDArray[np.uint64],
+    row_nonzero: NDArray[np.uint64],
+) -> tuple[NDArray[np.uint64], int]:
+    """ビットパック済みマスクを交差し、生存ビット数を数える。"""
+    node_mask = np.empty(base_mask.size, dtype=np.uint64)
+    count = 0
+    for index in range(base_mask.size):
+        word = base_mask[index] & ~row_nonzero[index]
+        node_mask[index] = word
+        while word != 0:
+            word &= word - np.uint64(1)
+            count += 1
+    return node_mask, count
 
 
-def build_shift_table(primes: Sequence[int]) -> list[NDArray[np.bool_]]:
+def pack_mask(mask: NDArray[np.bool_]) -> NDArray[np.uint64]:
+    """列ごとの bool マスクを、列順を保った uint64 ビット列に詰める。"""
+    packed = np.zeros((len(mask) + BITS_PER_WORD - 1) // BITS_PER_WORD, dtype=np.uint64)
+    for index in np.flatnonzero(mask):
+        packed[index // BITS_PER_WORD] |= np.uint64(1) << np.uint64(index % BITS_PER_WORD)
+    return packed
+
+
+def build_shift_table(primes: Sequence[int]) -> list[NDArray[np.uint64]]:
     """
     各階層(prime)ごとに、そのレベルで取り得る全てのシフト値
-    k = 0, 1, ..., p-1 に対応する shift_array(row, k) の結果を
-    あらかじめ計算してテーブル化する。
+    k = 0, 1, ..., p-1 に対応するビットパック済みマスクをあらかじめ計算する。
 
     Parameters
     ----------
@@ -124,17 +125,18 @@ def build_shift_table(primes: Sequence[int]) -> list[NDArray[np.bool_]]:
     Returns
     -------
     list[np.ndarray]
-        shift_table[level] は shape=(primes[level], COLS) の bool 配列。
-        shift_table[level][k] が「level段目の基準行を k だけ右シフトした行」
-        (= search で言う row_nonzero)に対応する。
+        shift_table[level] は shape=(primes[level], ceil(COLS / 64)) の
+        uint64 配列。各ビットは対応する列が除外対象かを表す。
     """
-    base_rows = build_base_rows(primes)
-    shift_table: list[NDArray[np.bool_]] = []
-    for level, p in enumerate(primes):
-        row = base_rows[level]
-        shifted = np.empty((p, COLS), dtype=bool)
+    shift_table: list[NDArray[np.uint64]] = []
+    for p in primes:
+        row = IDX % p == 1
+        shifted = np.empty(
+            (p, (COLS + BITS_PER_WORD - 1) // BITS_PER_WORD),
+            dtype=np.uint64,
+        )
         for k in range(p):
-            shifted[k] = shift_array(row, k)
+            shifted[k] = pack_mask(np.concatenate((np.zeros(k, dtype=bool), row[: COLS - k])))
         shift_table.append(shifted)
     return shift_table
 
@@ -150,11 +152,12 @@ class State:
     primes : list[int]
         探索対象の素数リスト(先頭から順に1階層ずつ対応)。
     shift_table : list[np.ndarray]
-        build_shift_table(primes[:depth]) で事前作成したシフト済み配列テーブル。
+        build_shift_table(primes[:depth]) で事前作成したビットパック済みテーブル。
         shift_table[level][key[level]] が search() で必要な行(row_nonzero)を
         直接与えるため、探索中に shift_array を呼ぶ必要がない。
     zero_mask : np.ndarray
-        shape=(COLS,) の真偽値配列。「現在の階層までで全て0だった列」を表す。
+        shape=(ceil(COLS / 64),) の uint64 配列。「現在の階層までで全て0だった列」
+        を各ビットで表す。
         search() 内で1階層進むたびに更新され、その階層の探索が終わったら
         呼び出し前の値に戻される(backtrack)。
     depth : int
@@ -191,12 +194,12 @@ class State:
         "pbar",
     )
 
-    def __init__(self, primes: Sequence[int], params: list[list[int]], shift_table: list[NDArray[np.bool_]], max_depth: int=MAX_DEPTH) -> None:
+    def __init__(self, primes: Sequence[int], params: list[list[int]], shift_table: list[NDArray[np.uint64]], max_depth: int=MAX_DEPTH) -> None:
         self.key: list[int] = []
         self.primes: Sequence[int] = primes
         self.params: list[list[int]] = params
         self.shift_table: list[NDArray[np.bool_]] = shift_table
-        self.zero_mask: NDArray[np.bool_] = np.ones(COLS, dtype=bool)
+        self.zero_mask: NDArray[np.uint64] = pack_mask(np.ones(COLS, dtype=bool))
         self.max_depth: int = max_depth
         self.max_count: int = 0
         self.shifts: list[list[int]] = []
@@ -264,7 +267,7 @@ class State:
             探索する階層数(= 使用する素数の個数)。可変。
         """
         key = self.key
-        stack: list[tuple[int, NDArray[np.bool_], Iterator[int]]] = [
+        stack: list[tuple[int, NDArray[np.uint64], Iterator[int]]] = [
             # (0, self.zero_mask, iter(range(self.primes[0])))
             (0, self.zero_mask, iter(self.params[0]))
         ]
@@ -287,9 +290,8 @@ class State:
             self.node_count += 1
             self.report_progress()
 
-            row_nonzero = self.shift_table[level][i]  # True = その素数の倍数位置(事前作成済み)
-            node_mask = base_mask & ~row_nonzero
-            count = int(np.count_nonzero(node_mask))
+            row_nonzero = self.shift_table[level][i]
+            node_mask, count = intersect_masks_and_count(base_mask, row_nonzero)
             # logger.debug("depth=%d key=%s count=%s", level + 1, key, count)
 
             if count + (depth - level) <= self.max_count:
@@ -308,8 +310,8 @@ class State:
                         self.results = 1
                         self.shifts.clear()
                         self.shifts.append(list(key))
-                        self.pbar.write(f"done key={list(key)} count={count}")
-                        logger.info(("done", level, list(key), count))
+                        # self.pbar.write(f"done key={list(key)} count={count}")
+                        # logger.info(("done", level, list(key), count))
                     elif count == self.max_count:
                         self.results += 1
                         self.shifts.append(list(key))
@@ -321,9 +323,9 @@ class State:
             # さらに深く探索: 子階層のループをスタックに積んで先に進む
             self.zero_mask = node_mask
             # next_p = self.primes[level + 1]
-            next_p = self.params[level +1]
-            # stack.append((level + 1, node_mask, iter(range(next_p))))
-            stack.append((level + 1, node_mask, iter(next_p)))
+            next_params = self.params[level + 1]
+            stack.append((level + 1, node_mask, iter(next_params)))
+
 
     def run(self, depth: int) -> "State":
         """primes[:depth] を使って深さ depth までの探索を実行するエントリポイント"""
@@ -332,6 +334,7 @@ class State:
             self.report_progress(force=True)
         finally:
             self.pbar.close()
+            pass
 
         return self
 
@@ -403,9 +406,18 @@ if __name__ == "__main__":
     state = State(primes, params, shift_table, max_depth=MAX_DEPTH)
     result_state = state.run(DEPTH)
 
-    logger.info("最大値: %d",result_state.max_count)
-    logger.info("該当件数: %d", result_state.results)
-    for shift in result_state.shifts:
-        logger.debug(f"{shift}")
+    # 現在の年月日時分秒を取得
+    now = datetime.datetime.now()
+    timestamp = now.strftime("%Y%m%d_%H%M%S")
+
+    filename = Path(__file__).resolve().parent / f"result_depth{DEPTH}_{timestamp}.txt"
+    with open(filename, "w", encoding="UTF-8") as f:
+        logger.info("最大値: %d",result_state.max_count)
+        f.write(f"最大値:{result_state.max_count}\n")
+        logger.info("該当件数: %d", result_state.results)
+        f.write(f"該当件数:{result_state.results}\n")
+        for shift in result_state.shifts:
+            logger.debug(f"{shift}")
+            f.write(f"{shift}\n")
 
     logger.info("HLSearch 終了")
